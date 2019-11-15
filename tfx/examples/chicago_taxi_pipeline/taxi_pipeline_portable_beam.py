@@ -18,6 +18,9 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import multiprocessing
+import absl
+
 import datetime
 import os
 from typing import Text
@@ -32,8 +35,7 @@ from tfx.components import Trainer
 from tfx.components import Transform
 from tfx.orchestration import metadata
 from tfx.orchestration import pipeline
-from tfx.orchestration.airflow.airflow_dag_runner import AirflowDagRunner
-from tfx.orchestration.airflow.airflow_dag_runner import AirflowPipelineConfig
+from tfx.orchestration.beam.beam_dag_runner import BeamDagRunner
 from tfx.proto import evaluator_pb2
 from tfx.proto import pusher_pb2
 from tfx.proto import trainer_pb2
@@ -70,7 +72,8 @@ _airflow_config = {
 
 def _create_pipeline(pipeline_name: Text, pipeline_root: Text, data_root: Text,
                      module_file: Text, serving_model_dir: Text,
-                     metadata_path: Text) -> pipeline.Pipeline:
+                     metadata_path: Text,
+                     worker_parallelism: int) -> pipeline.Pipeline:
   """Implements the chicago taxi pipeline with TFX."""
   examples = external_input(data_root)
 
@@ -145,6 +148,10 @@ def _create_pipeline(pipeline_name: Text, pipeline_root: Text, data_root: Text,
           # setup_beam_on_(flink|spark).sh
           '--job_endpoint=localhost:8099',
           '--environment_type=LOOPBACK',
+          '--sdk_worker_parallelism=%d' % worker_parallelism,
+          '--experiments=use_loopback_process_worker=True',
+          '--environment_cache_millis=1000000',
+
           # TODO(BEAM-6754): Utilize multicore in LOOPBACK environment.  # pylint: disable=g-bad-todo
           # TODO(BEAM-5167): Use concurrency information from SDK Harness.  # pylint: disable=g-bad-todo
           # Note; We use 100 worker threads to mitigate the issue with
@@ -160,20 +167,31 @@ def _create_pipeline(pipeline_name: Text, pipeline_root: Text, data_root: Text,
           # ----- Flink runner-specific Args -----.
           # TODO(b/126725506): Set the task parallelism based on cpu cores.
           # TODO(FLINK-10672): Obviate setting BATCH_FORCED.
+          '--parallelism=%d' % worker_parallelism,
           '--execution_mode_for_batch=BATCH_FORCED',
       ],
       # LINT.ThenChange(setup/setup_beam_on_spark.sh)
       # LINT.ThenChange(setup/setup_beam_on_flink.sh)
   )
 
+# To run this pipeline from the python CLI:
+#   $python taxi_pipeline_beam.py
+if __name__ == '__main__':
+  absl.logging.set_verbosity(absl.logging.INFO)
 
-# TODO(jyzhao): consider using beam orchestrator after b/137294896.
-# 'DAG' below need to be kept for Airflow to detect dag.
-DAG = AirflowDagRunner(AirflowPipelineConfig(_airflow_config)).run(
-    _create_pipeline(
-        pipeline_name=_pipeline_name,
-        pipeline_root=_pipeline_root,
-        data_root=_data_root,
-        module_file=_module_file,
-        serving_model_dir=_serving_model_dir,
-        metadata_path=_metadata_path))
+  try:
+    parallelism = multiprocessing.cpu_count()
+  except NotImplementedError:
+    parallelism = 1
+  absl.logging.info('Using %d process(es) for Beam pipeline execution.' %
+                    parallelism)
+
+  BeamDagRunner().run(
+      _create_pipeline(
+          pipeline_name=_pipeline_name,
+          pipeline_root=_pipeline_root,
+          data_root=_data_root,
+          module_file=_module_file,
+          serving_model_dir=_serving_model_dir,
+          metadata_path=_metadata_path,
+          worker_parallelism=parallelism))
